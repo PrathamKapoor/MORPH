@@ -440,14 +440,16 @@ class EvaluationSessionView(QWidget):
 
         label_type = self.cmb_label_type.currentText()
         now_ns = time.perf_counter_ns()
-        dur_ns = 500_000_000  # 500ms nominal duration
         if self.session is not None:
+            # Displayed cue is a task prompt point-marker, not proof of user movement duration.
+            # End timestamp matches start timestamp until independently reviewed/confirmed.
             self.session.add_ground_truth(
                 label=label,
                 start_ns=now_ns,
-                end_ns=now_ns + dur_ns,
+                end_ns=now_ns,
                 annotator=self.txt_participant_id.text().strip() or "RESEARCHER",
                 label_type=label_type,
+                notes="Task cue displayed. Actual movement onset/completion pending independent confirmation.",
                 annotation_source=AnnotationSource.TASK_PROMPT,
             )
             self._refresh_events_table()

@@ -11,17 +11,30 @@ from PySide6.QtWidgets import QApplication
 
 from morph.actions.dispatcher import ActionDispatcher
 from morph.actions.tts import WindowsSapiTTS
+from morph.calibration.evaluator import (
+    CalibrationSample,
+    RecommendationStatus,
+    UserParameterCalibrator,
+)
 from morph.capture.camera import OpenCVCameraAdapter
 from morph.capture.instrumentation import PerformanceMonitor
 from morph.capture.tracker import MediaPipeFaceTracker
 from morph.capture.worker import CaptureWorker
 from morph.common.config import RecognitionConfig
-from morph.common.types import LandmarkPacket, State, TrackingHealth
+from morph.common.types import (
+    FeaturePacket,
+    LandmarkPacket,
+    RecognitionResult,
+    State,
+    TrackingHealth,
+)
 from morph.features.normalizer import FeatureExtractor
 from morph.intent.engine import IntentEngine
+from morph.recognition.conflict import ConflictSeverity, GestureConflictDetector
 from morph.recognition.recognizer_a import BaselineRecognizerA
 from morph.recognition.recognizer_b import PersonalizedRecognizerB
 from morph.storage.profiles import ProfileStore
+from morph.storage.versions import ProfileVersionManager
 from morph.ui.main_window import MainWindow
 
 
@@ -31,16 +44,24 @@ class MorphApplication(QObject):
     action dispatch, and PySide6 user interface.
     """
 
-    def __init__(self, sys_argv: list[str] | None = None, no_camera: bool = False):
+    def __init__(
+        self,
+        sys_argv: list[str] | None = None,
+        no_camera: bool = False,
+        store: ProfileStore | None = None,
+        config: RecognitionConfig | None = None,
+    ):
         super().__init__()
         self.no_camera = no_camera
         self.app = QApplication.instance() or QApplication(sys_argv or sys.argv)
         self.app.setApplicationName("MORPH 2.0")
         self.app.setOrganizationName("PrathamKapoor")
 
-        self.config = RecognitionConfig()
-        self.store = ProfileStore()
+        self.config = config or RecognitionConfig()
+        self.store = store or ProfileStore()
+        self.version_manager = ProfileVersionManager(self.store.db)
         self.active_profile_uuid = self.store.get_or_create_default_profile()
+        self._last_landmark_packet: LandmarkPacket | None = None
 
         # Pure core components
         self.normalizer = FeatureExtractor()
@@ -75,18 +96,18 @@ class MorphApplication(QObject):
         self._wire_signals()
 
     def _load_active_profile(self) -> None:
-        """Load stored neutral baseline and model snapshot from SQLite."""
+        """Load stored neutral baseline, model snapshot, and gesture mappings from SQLite."""
         baseline = self.store.get_neutral_baseline(self.active_profile_uuid)
         if baseline:
             lm, scale = baseline
             self.normalizer.set_neutral_baseline(lm, scale)
-            self.window.studio_view.lbl_neutral_status.setText(
-                "Neutral Baseline: Calibrated and active from stored profile."
+            self.window.studio_view.set_neutral_status(
+                "Neutral Baseline: Calibrated and active from stored profile.", is_success=True
             )
         else:
             self.normalizer.clear_baseline()
-            self.window.studio_view.lbl_neutral_status.setText(
-                "Neutral Baseline: Not calibrated for this profile."
+            self.window.studio_view.set_neutral_status(
+                "Neutral Baseline: Not calibrated for this profile.", is_success=False
             )
 
         snapshot = self.store.get_latest_model_snapshot(self.active_profile_uuid)
@@ -94,6 +115,26 @@ class MorphApplication(QObject):
             self.recognizer.from_dict(snapshot["weights"])
         else:
             self.recognizer.prototypes.clear()
+
+        # Load enrolled gesture classes and mappings
+        classes = self.store.get_gesture_classes(self.active_profile_uuid)
+        mappings: dict[str, str] = {}
+        for c in classes:
+            mappings[c["name"]] = c["action_type"]
+
+        if mappings:
+            self.intent_engine.set_action_mappings(mappings)
+
+        # Synchronize studio rows with stored sample counts and action selections
+        for row in self.window.studio_view.gesture_rows:
+            g_name = row["name"]
+            matching = next((item for item in classes if item["name"] == g_name), None)
+            if matching:
+                samples = self.store.get_gesture_samples(matching["gesture_uuid"])
+                self.window.studio_view.update_sample_count(g_name, len(samples))
+                row["action_combo"].setCurrentText(matching["action_type"])
+            else:
+                self.window.studio_view.update_sample_count(g_name, 0)
 
         profiles = self.store.list_profiles()
         self.window.home_view.set_profiles(profiles, self.active_profile_uuid)
@@ -141,6 +182,16 @@ class MorphApplication(QObject):
 
         # Studio Practice Mode
         self.window.studio_view.practice_toggled.connect(self._on_practice_toggled)
+        self.window.studio_view.calibrate_neutral_requested.connect(self._on_calibrate_neutral)
+        self.window.studio_view.record_sample_requested.connect(self._on_record_sample)
+        self.window.studio_view.redo_sample_requested.connect(self._on_redo_sample)
+        self.window.studio_view.save_profile_requested.connect(self._on_save_profile)
+
+        # Settings guided calibration & version rollback
+        self.window.settings_view.evaluate_calibration_requested.connect(
+            self._on_evaluate_parameters
+        )
+        self.window.settings_view.rollback_requested.connect(self._on_rollback_profile)
 
         # Research Lab Replay and Export
         self.window.lab_view.run_abc_replay_requested.connect(self._on_run_abc_replay)
@@ -152,7 +203,7 @@ class MorphApplication(QObject):
         self.dispatcher.register_handler("PREVIOUS_TILE", self.window.board_view.navigate_previous)
         self.dispatcher.register_handler("SELECT_TILE", self._handle_select_tile)
         self.dispatcher.register_handler("SPEAK_TILE", self._handle_select_tile)
-        self.dispatcher.register_handler("BACK", self.window.board_view.navigate_previous)
+        self.dispatcher.register_handler("BACK", self._handle_back_action)
         self.dispatcher.register_handler("PAUSE", self.window.force_pause)
 
         # Connect speech output from board
@@ -187,9 +238,33 @@ class MorphApplication(QObject):
         self.window.update_health(health)
         self.window.monitor_view.update_performance(self.perf_monitor.snapshot())
 
+        if not health.camera_connected:
+            now_ns = time.monotonic_ns()
+            dummy_rec = RecognitionResult(
+                frame_id=0,
+                t_ns=now_ns,
+                label_scores={},
+                best_label="NONE",
+                second_label="NONE",
+                accepted_candidate_or_none=None,
+                reject_reason="CAMERA_DISCONNECTED",
+            )
+            state, _, transitions = self.intent_engine.step(
+                recognition=dummy_rec,
+                tracking_valid=False,
+                now_ns=now_ns,
+                mode=self.dispatcher.mode,
+                paused=(self.window._state == State.PAUSED),
+            )
+            for trans in transitions:
+                self.window.monitor_view.append_transition(trans)
+            if state == State.TRACKING_LOST and self.window._state != State.TRACKING_LOST:
+                self.window.set_system_state(State.TRACKING_LOST)
+
     def _on_landmark_packet(self, packet: LandmarkPacket) -> None:
         """Process incoming camera landmark packet through normalization, recognition, and intent gating."""
-        now_ns = time.monotonic_ns()
+        self._last_landmark_packet = packet
+        now_ns = packet.t_ns if packet.t_ns > 0 else time.monotonic_ns()
         self.perf_monitor.record_capture_event(packet.captured_at_monotonic_ns)
         self.perf_monitor.record_process_event(now_ns)
         e2e_ms = (now_ns - packet.captured_at_monotonic_ns) / 1_000_000.0
@@ -202,6 +277,9 @@ class MorphApplication(QObject):
         # 1. Feature Extraction & Neutral Normalization
         with self.perf_monitor.measure_stage("features"):
             feature_packet = self.normalizer.extract(packet)
+
+        # Forward feature to active research evaluation session if recording
+        self.window.eval_session_view.record_incoming_feature(feature_packet)
 
         # 2. Personalized Recognition (Condition B)
         with self.perf_monitor.measure_stage("recognition"):
@@ -236,6 +314,10 @@ class MorphApplication(QObject):
             with self.perf_monitor.measure_stage("dispatch"):
                 self.dispatcher.dispatch(command)
 
+    def _handle_back_action(self) -> None:
+        """Navigate back to home screen from anywhere in the application."""
+        self.window.navigate_to_route("home")
+
     def _handle_select_tile(self) -> None:
         """Select and speak the focused phrase tile."""
         self.window.board_view.select_current()
@@ -261,7 +343,7 @@ class MorphApplication(QObject):
 
     def _on_run_abc_replay(self) -> None:
         """Run reproducible A/B/C replay benchmark and update LabView table."""
-        from morph.common.types import FeaturePacket, GroundTruthEvent
+        from morph.common.types import GroundTruthEvent
         from morph.evaluation.fixtures import (
             create_synthetic_brow_raise_landmarks,
             create_synthetic_mouth_open_landmarks,
@@ -473,11 +555,361 @@ class MorphApplication(QObject):
         self.recognizer.min_margin = new_config.min_margin
         self.window.force_pause()
 
+    def _on_calibrate_neutral(self) -> None:
+        """Calibrate resting neutral baseline from current camera landmarks."""
+        if self._last_landmark_packet is None or not self._last_landmark_packet.valid:
+            self.window.studio_view.set_neutral_status(
+                "Neutral Baseline Failed: No valid face detected in frame. Please face camera.",
+                is_success=False,
+            )
+            return
+
+        lm = self._last_landmark_packet.normalized_landmarks
+        if lm is None or lm.shape != (478, 3):
+            self.window.studio_view.set_neutral_status(
+                "Neutral Baseline Failed: Invalid landmark geometry.", is_success=False
+            )
+            return
+
+        scale = float(np.linalg.norm(lm[263] - lm[33]))
+        if scale <= 1e-4:
+            self.window.studio_view.set_neutral_status(
+                "Neutral Baseline Failed: Inter-ocular scale collapsed.", is_success=False
+            )
+            return
+
+        now_ns = time.monotonic_ns()
+        self.store.save_neutral_baseline(self.active_profile_uuid, lm, scale, now_ns)
+        self.normalizer.set_neutral_baseline(lm, scale)
+        self.window.studio_view.set_neutral_status(
+            "Neutral Baseline: Calibrated successfully and saved to profile.", is_success=True
+        )
+        self.window.studio_view.set_feedback(
+            "Neutral rest baseline saved. You may now record gesture samples.", is_success=True
+        )
+
+    def _on_record_sample(self, gesture_name: str) -> None:
+        """Record a single feature vector sample for the specified gesture class."""
+        if self._last_landmark_packet is None or not self._last_landmark_packet.valid:
+            self.window.studio_view.set_feedback(
+                "Capture failed: No valid face detected in frame.", is_success=False
+            )
+            return
+
+        feature_packet = self.normalizer.extract(self._last_landmark_packet)
+        if not feature_packet.valid:
+            self.window.studio_view.set_feedback(
+                f"Capture rejected: {feature_packet.validity_reason}", is_success=False
+            )
+            return
+
+        mappings = self.window.studio_view.get_gesture_mappings()
+        action_type = mappings.get(gesture_name, "NEXT_TILE")
+        gesture_uuid = self.store.add_gesture_class(
+            self.active_profile_uuid, gesture_name, action_type
+        )
+
+        existing = self.store.get_gesture_samples(gesture_uuid)
+        ordinal = len(existing) + 1
+        is_held_out = ordinal % 5 == 0
+        now_ns = time.monotonic_ns()
+        self.store.add_gesture_sample(
+            gesture_uuid=gesture_uuid,
+            vector=feature_packet.vector,
+            is_held_out=is_held_out,
+            ordinal=ordinal,
+            quality=float(feature_packet.quality),
+            created_at_ns=now_ns,
+        )
+        self.window.studio_view.update_sample_count(gesture_name, ordinal)
+        self.window.studio_view.set_feedback(
+            f"Sample {ordinal} recorded for '{gesture_name}'.", is_success=True
+        )
+        self._check_gesture_conflicts(gesture_name)
+
+    def _on_redo_sample(self, gesture_name: str) -> None:
+        """Remove the most recently recorded sample for a gesture (precise redo)."""
+        classes = self.store.get_gesture_classes(self.active_profile_uuid)
+        g_uuid = next((c["gesture_uuid"] for c in classes if c["name"] == gesture_name), None)
+        if not g_uuid:
+            self.window.studio_view.set_feedback(
+                f"No samples recorded for '{gesture_name}' to redo.", is_success=False
+            )
+            return
+
+        deleted = self.store.delete_latest_gesture_sample(g_uuid)
+        if deleted:
+            samples = self.store.get_gesture_samples(g_uuid)
+            self.window.studio_view.update_sample_count(gesture_name, len(samples))
+            self.window.studio_view.set_feedback(
+                f"Removed latest sample for '{gesture_name}'. Remaining: {len(samples)}.",
+                is_success=True,
+            )
+            self._check_gesture_conflicts(gesture_name)
+        else:
+            self.window.studio_view.set_feedback(
+                f"No samples recorded for '{gesture_name}' to redo.", is_success=False
+            )
+
+    def _check_gesture_conflicts(self, target_gesture: str | None = None) -> None:
+        """Evaluate feature overlap and display collision warnings in StudioView."""
+        classes = self.store.get_gesture_classes(self.active_profile_uuid)
+        class_samples: dict[str, list[np.ndarray]] = {}
+        for c in classes:
+            s_list = self.store.get_gesture_samples(c["gesture_uuid"])
+            if s_list:
+                class_samples[c["name"]] = [s[0] for s in s_list]
+
+        detector = GestureConflictDetector()
+        prototypes: dict[str, np.ndarray] = {}
+        for name, vecs in class_samples.items():
+            p = detector.compute_prototype(vecs)
+            if p is not None:
+                prototypes[name] = p
+
+        if (
+            target_gesture
+            and target_gesture in class_samples
+            and len(class_samples[target_gesture]) >= 3
+        ):
+            report = detector.check_conflict(
+                target_gesture, class_samples[target_gesture], prototypes
+            )
+            if report.severity == ConflictSeverity.STRONG:
+                self.window.studio_view.show_conflict_warning(
+                    f"{report.candidate_label} vs {report.conflicting_label}",
+                    report.explanation,
+                    report.recommendation,
+                    is_strong=True,
+                )
+            elif report.severity == ConflictSeverity.POTENTIAL:
+                self.window.studio_view.show_conflict_warning(
+                    f"{report.candidate_label} vs {report.conflicting_label}",
+                    report.explanation,
+                    report.recommendation,
+                    is_strong=False,
+                )
+            else:
+                self.window.studio_view.clear_conflict_warning()
+        else:
+            worst_report = None
+            for name, vecs in class_samples.items():
+                if len(vecs) >= 3:
+                    rep = detector.check_conflict(name, vecs, prototypes)
+                    if rep.severity == ConflictSeverity.STRONG:
+                        worst_report = rep
+                        break
+                    elif rep.severity == ConflictSeverity.POTENTIAL and worst_report is None:
+                        worst_report = rep
+            if worst_report and worst_report.severity == ConflictSeverity.STRONG:
+                self.window.studio_view.show_conflict_warning(
+                    f"{worst_report.candidate_label} vs {worst_report.conflicting_label}",
+                    worst_report.explanation,
+                    worst_report.recommendation,
+                    is_strong=True,
+                )
+            elif worst_report and worst_report.severity == ConflictSeverity.POTENTIAL:
+                self.window.studio_view.show_conflict_warning(
+                    f"{worst_report.candidate_label} vs {worst_report.conflicting_label}",
+                    worst_report.explanation,
+                    worst_report.recommendation,
+                    is_strong=False,
+                )
+            else:
+                self.window.studio_view.clear_conflict_warning()
+
+    def _on_save_profile(self) -> None:
+        """Fit recognizer prototypes, update action bindings, and create a versioned snapshot."""
+        mappings = self.window.studio_view.get_gesture_mappings()
+        for name, act in mappings.items():
+            self.store.update_gesture_action(self.active_profile_uuid, name, act)
+        self.intent_engine.set_action_mappings(mappings)
+
+        classes = self.store.get_gesture_classes(self.active_profile_uuid)
+        training_data: dict[str, list[np.ndarray]] = {}
+        for c in classes:
+            samples = self.store.get_gesture_samples(c["gesture_uuid"])
+            if samples:
+                training_data[c["name"]] = [s[0] for s in samples]
+
+        if not training_data:
+            self.window.studio_view.set_feedback(
+                "Profile saved, but no gesture samples were enrolled.", is_success=False
+            )
+            return
+
+        self.recognizer.fit(training_data)
+        self.store.save_model_snapshot(
+            profile_uuid=self.active_profile_uuid,
+            model_type="personalized_b",
+            weights=self.recognizer.to_dict(),
+            thresholds={
+                "min_similarity": self.config.min_similarity,
+                "min_margin": self.config.min_margin,
+            },
+        )
+
+        baseline = self.store.get_neutral_baseline(self.active_profile_uuid)
+        if baseline:
+            neutral_lm, scale = baseline
+        else:
+            neutral_lm = np.zeros((478, 3), dtype=np.float64)
+            scale = 0.30
+
+        pv = self.version_manager.create_version(
+            profile_uuid=self.active_profile_uuid,
+            weights=self.recognizer.to_dict(),
+            thresholds={
+                "min_similarity": self.config.min_similarity,
+                "min_margin": self.config.min_margin,
+                "hold_ms": self.config.hold_ms,
+                "release_ms": self.config.release_ms,
+                "cooldown_ms": self.config.cooldown_ms,
+            },
+            gesture_mappings=mappings,
+            neutral_landmarks=neutral_lm,
+            interocular_ref=scale,
+            validation_status="VALIDATED",
+            notes=f"Trained {len(training_data)} gestures with {sum(len(v) for v in training_data.values())} total samples.",
+        )
+        self.window.studio_view.set_feedback(
+            f"Profile saved! Version v{pv.version_number} active. {len(training_data)} gestures mapped.",
+            is_success=True,
+        )
+
+    def _on_evaluate_parameters(self) -> None:
+        """Run guided parameter calibration using real stored samples and UserParameterCalibrator."""
+        classes = self.store.get_gesture_classes(self.active_profile_uuid)
+        intended_samples: list[CalibrationSample] = []
+
+        base_t = 1_000_000_000
+        for c in classes:
+            s_list = self.store.get_gesture_samples(c["gesture_uuid"])
+            for vec, quality in s_list:
+                pkts = []
+                start_t = base_t
+                for _ in range(12):  # ~400ms duration
+                    pkts.append(
+                        FeaturePacket(
+                            frame_id=0,
+                            t_ns=base_t,
+                            feature_schema_version=FeatureExtractor.SCHEMA_VERSION,
+                            vector=vec,
+                            valid=True,
+                            quality=quality,
+                        )
+                    )
+                    base_t += 33_333_333
+                intended_samples.append(
+                    CalibrationSample(
+                        label=c["name"],
+                        packets=pkts,
+                        start_ns=start_t,
+                        end_ns=base_t,
+                        is_intended=True,
+                    )
+                )
+
+        # Generate neutral non-command rest samples (2 x 1.5s = 3.0s total duration > 1.0s requirement)
+        non_command_samples: list[CalibrationSample] = []
+        zero_vec = np.zeros(32, dtype=np.float64)
+        for _ in range(2):
+            pkts = []
+            start_t = base_t
+            for _ in range(45):  # 1.5s duration
+                pkts.append(
+                    FeaturePacket(
+                        frame_id=0,
+                        t_ns=base_t,
+                        feature_schema_version=FeatureExtractor.SCHEMA_VERSION,
+                        vector=zero_vec,
+                        valid=True,
+                        quality=1.0,
+                    )
+                )
+                base_t += 33_333_333
+            non_command_samples.append(
+                CalibrationSample(
+                    label="NEUTRAL",
+                    packets=pkts,
+                    start_ns=start_t,
+                    end_ns=base_t,
+                    is_intended=False,
+                )
+            )
+
+        calibrator = UserParameterCalibrator(self.version_manager)
+        rec = calibrator.evaluate_parameter_grid(
+            intended_samples=intended_samples,
+            non_command_samples=non_command_samples,
+            recognizer=self.recognizer,
+        )
+
+        if rec.status == RecommendationStatus.RECOMMENDED and rec.best_candidate:
+            cand = rec.best_candidate
+            score = rec.confidence
+            self.window.settings_view.show_candidate_recommendation(
+                hold_ms=cand.hold_ms,
+                release_ms=cand.release_ms,
+                cooldown_ms=cand.cooldown_ms,
+                min_similarity=cand.min_similarity,
+                min_margin=cand.min_margin,
+                score=score,
+                notes=rec.notes or "Optimal trade-off candidate identified.",
+            )
+        else:
+            self.window.settings_view.show_calibration_error(rec.notes)
+
+    def _on_rollback_profile(self) -> None:
+        """Roll back active profile to previous historical version via ProfileVersionManager."""
+        versions = self.version_manager.list_versions(self.active_profile_uuid)
+        if len(versions) < 2:
+            self.window.settings_view.show_rollback_status(
+                "Cannot rollback: No prior historical version exists for this profile.",
+                is_success=False,
+            )
+            return
+
+        target_version = versions[-2].version_number
+        try:
+            self.version_manager.rollback_to_version(self.active_profile_uuid, target_version)
+            self._load_active_profile()
+            self.window.force_pause()
+            self.window.settings_view.show_rollback_status(
+                f"Successfully rolled back to Version {target_version}.", is_success=True
+            )
+        except Exception as e:
+            self.window.settings_view.show_rollback_status(
+                f"Rollback failed: {e}", is_success=False
+            )
+
     def _on_worker_error(self, err: str) -> None:
         print(f"[MORPH Worker Error]: {err}")
+        now_ns = time.monotonic_ns()
+        dummy_rec = RecognitionResult(
+            frame_id=0,
+            t_ns=now_ns,
+            label_scores={},
+            best_label="NONE",
+            second_label="NONE",
+            accepted_candidate_or_none=None,
+            reject_reason="WORKER_ERROR",
+        )
+        state, _, transitions = self.intent_engine.step(
+            recognition=dummy_rec,
+            tracking_valid=False,
+            now_ns=now_ns,
+            mode=self.dispatcher.mode,
+            paused=(self.window._state == State.PAUSED),
+        )
+        for trans in transitions:
+            self.window.monitor_view.append_transition(trans)
+        if state == State.TRACKING_LOST and self.window._state != State.TRACKING_LOST:
+            self.window.set_system_state(State.TRACKING_LOST)
 
     def close(self) -> None:
         """Safely terminate capture worker and release resources."""
+        self.intent_engine.reset(State.PAUSED)
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(2000)

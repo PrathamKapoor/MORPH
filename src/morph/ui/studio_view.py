@@ -227,7 +227,29 @@ class StudioView(QWidget):
                 row["progress"].setValue(min(count, 10))
                 if count >= 5:
                     row["count_label"].setStyleSheet("color: #34D399; font-weight: bold;")
+                else:
+                    row["count_label"].setStyleSheet("color: #FBBF24; font-weight: bold;")
                 break
+
+    def get_gesture_mappings(self) -> dict[str, str]:
+        """Return user-configured gesture-to-action bindings from studio rows."""
+        return {row["name"]: row["action_combo"].currentText() for row in self.gesture_rows}
+
+    def set_neutral_status(self, text: str, is_success: bool = True) -> None:
+        """Update neutral baseline status label with color coding."""
+        self.lbl_neutral_status.setText(text)
+        color = "#34D399" if is_success else "#F87171"
+        self.lbl_neutral_status.setStyleSheet(
+            f"color: {color}; font-size: 14px; font-weight: bold;"
+        )
+
+    def set_feedback(self, text: str, is_success: bool = True) -> None:
+        """Update studio feedback banner with color coding."""
+        self.lbl_practice_feedback.setText(text)
+        color = "#34D399" if is_success else "#F87171"
+        self.lbl_practice_feedback.setStyleSheet(
+            f"color: {color}; font-size: 14px; font-weight: bold;"
+        )
 
     def update_practice_result(self, result: RecognitionResult) -> None:
         """Update live recognition scores in Practice Mode."""

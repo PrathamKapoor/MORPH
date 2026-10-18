@@ -189,10 +189,32 @@ class ProfileStore:
     list_gesture_classes = get_profile_gestures
 
     def delete_gesture_samples(self, gesture_uuid: str) -> None:
-        """Clear all samples for a gesture (e.g. for redo)."""
+        """Clear all samples for a gesture."""
         self.db.execute_write(
             "DELETE FROM gesture_samples WHERE gesture_uuid = ?;", (gesture_uuid,)
         )
+
+    def delete_latest_gesture_sample(self, gesture_uuid: str) -> bool:
+        """Delete only the most recently recorded sample for a gesture (precise redo)."""
+        with self.db.get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT sample_uuid FROM gesture_samples
+                WHERE gesture_uuid = ?
+                ORDER BY sample_ordinal DESC, created_at_ns DESC
+                LIMIT 1;
+                """,
+                (gesture_uuid,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return False
+            conn.execute(
+                "DELETE FROM gesture_samples WHERE sample_uuid = ?;",
+                (row["sample_uuid"],),
+            )
+            conn.commit()
+            return True
 
     def save_model_snapshot(
         self,

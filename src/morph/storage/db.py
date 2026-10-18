@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import datetime
+import os
 import sqlite3
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Generator
@@ -16,10 +18,17 @@ class DatabaseManager:
 
     def __init__(self, db_path: str | Path | None = None):
         if db_path is None:
-            root = Path(__file__).resolve().parents[3]
-            db_dir = root / "data"
-            db_dir.mkdir(parents=True, exist_ok=True)
-            self.db_path = db_dir / "morph.db"
+            if getattr(sys, "frozen", False):
+                base_dir = (
+                    Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+                    / "MORPH"
+                    / "data"
+                )
+            else:
+                root = Path(__file__).resolve().parents[3]
+                base_dir = root / "data"
+            base_dir.mkdir(parents=True, exist_ok=True)
+            self.db_path = base_dir / "morph.db"
         else:
             self.db_path = Path(db_path)
             self.db_path.parent.mkdir(parents=True, exist_ok=True)

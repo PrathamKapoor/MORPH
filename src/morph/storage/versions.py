@@ -77,7 +77,6 @@ class ProfileVersionManager:
         if validation_status not in ("VALIDATED", "CANDIDATE", "DEPRECATED"):
             raise ValueError(f"Unknown validation status: {validation_status}")
 
-        version_uuid = str(uuid.uuid4())
         now_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         blob = neutral_landmarks.astype(np.float64).tobytes()
@@ -86,8 +85,10 @@ class ProfileVersionManager:
         mappings_json = json.dumps(gesture_mappings)
 
         next_v = 1
-        for attempt in range(5):
+        version_uuid = str(uuid.uuid4())
+        for attempt in range(25):
             try:
+                version_uuid = str(uuid.uuid4())
                 with self.db.get_connection() as conn:
                     cursor = conn.execute(
                         "SELECT COALESCE(MAX(version_number), 0) + 1 as next_v FROM profile_versions WHERE profile_uuid = ?;",
@@ -136,9 +137,9 @@ class ProfileVersionManager:
                     conn.commit()
                     break
             except sqlite3.IntegrityError:
-                if attempt == 4:
+                if attempt == 24:
                     raise
-                time.sleep(0.01 * (attempt + 1))
+                time.sleep(0.005 * (attempt + 1))
 
         return ProfileVersion(
             version_uuid=version_uuid,

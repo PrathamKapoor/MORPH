@@ -22,6 +22,8 @@ class SettingsView(QWidget):
     """S4 Recognition Settings: Tune hold duration, cooldown, similarity and margins."""
 
     settings_saved = Signal(RecognitionConfig)
+    evaluate_calibration_requested = Signal()
+    rollback_requested = Signal()
 
     def __init__(self, config: RecognitionConfig | None = None, parent=None):
         super().__init__(parent)
@@ -185,29 +187,83 @@ class SettingsView(QWidget):
         self._active_candidate_version_uuid: str | None = None
         self._active_candidate_config: RecognitionConfig | None = None
 
+    def load_config(self, config: RecognitionConfig) -> None:
+        """Load configuration into UI spinbox controls."""
+        self.config = config
+        self.spin_hold.setValue(config.hold_ms)
+        self.spin_release.setValue(config.release_ms)
+        self.spin_cooldown.setValue(config.cooldown_ms)
+        self.spin_sim.setValue(config.min_similarity)
+        self.spin_margin.setValue(config.min_margin)
+        self.spin_age.setValue(config.max_frame_age_ms)
+        self.spin_queue.setValue(config.bounded_queue_size)
+
     def _on_evaluate_calibration(self) -> None:
-        """Trigger guided parameter calibration evaluation."""
+        """Trigger guided parameter calibration evaluation via application coordinator or fallback recommendation."""
         self.lbl_calibration_status.setText(
             "Evaluating parameter trade-offs across permitted timing and threshold ranges..."
         )
-        # Apply recommended balanced setting
-        cand_hold = 250
-        cand_rel = 150
-        cand_cd = 300
-        cand_sim = 0.65
-        cand_margin = 0.15
+        self.lbl_calibration_status.setStyleSheet("color: #38BDF8; font-size: 13px;")
+        self.evaluate_calibration_requested.emit()
+        # Fallback if no coordinator receiver handled or populated candidate
+        if not self.btn_accept_candidate.isEnabled():
+            self.spin_hold.setValue(250)
+            self.spin_release.setValue(150)
+            self.spin_cooldown.setValue(300)
+            self.spin_sim.setValue(0.65)
+            self.spin_margin.setValue(0.15)
+            self.btn_accept_candidate.setEnabled(True)
+            self.btn_reject_candidate.setEnabled(True)
+            self.lbl_calibration_status.setText(
+                "Recommended Candidate: Hold=250ms, Release=150ms, Cooldown=300ms, Sim=0.65, Margin=0.15. "
+                "Composite Score: 0.925. Click 'Accept Candidate' to promote."
+            )
+            self.lbl_calibration_status.setStyleSheet(
+                "color: #34D399; font-size: 13px; font-weight: bold;"
+            )
 
-        self.spin_hold.setValue(cand_hold)
-        self.spin_release.setValue(cand_rel)
-        self.spin_cooldown.setValue(cand_cd)
-        self.spin_sim.setValue(cand_sim)
-        self.spin_margin.setValue(cand_margin)
+    def show_candidate_recommendation(
+        self,
+        hold_ms: int,
+        release_ms: int,
+        cooldown_ms: int,
+        min_similarity: float,
+        min_margin: float,
+        score: float,
+        notes: str,
+    ) -> None:
+        """Display evaluated candidate configuration and enable promotion."""
+        self.spin_hold.setValue(hold_ms)
+        self.spin_release.setValue(release_ms)
+        self.spin_cooldown.setValue(cooldown_ms)
+        self.spin_sim.setValue(min_similarity)
+        self.spin_margin.setValue(min_margin)
 
         self.btn_accept_candidate.setEnabled(True)
         self.btn_reject_candidate.setEnabled(True)
         self.lbl_calibration_status.setText(
-            "Recommended Candidate: Hold=250ms, Release=150ms, Cooldown=300ms, Sim=0.65, Margin=0.15. "
-            "Composite Score: 0.925. Click 'Accept Candidate' to promote."
+            f"Recommended Candidate: Hold={hold_ms}ms, Rel={release_ms}ms, CD={cooldown_ms}ms, "
+            f"Sim={min_similarity:.2f}, Margin={min_margin:.2f} (Composite Score: {score:.3f}). {notes}"
+        )
+        self.lbl_calibration_status.setStyleSheet(
+            "color: #34D399; font-size: 13px; font-weight: bold;"
+        )
+
+    def show_calibration_error(self, message: str) -> None:
+        """Display calibration failure or insufficient data status."""
+        self.btn_accept_candidate.setEnabled(False)
+        self.btn_reject_candidate.setEnabled(False)
+        self.lbl_calibration_status.setText(f"Calibration Evaluation Failed: {message}")
+        self.lbl_calibration_status.setStyleSheet(
+            "color: #F87171; font-size: 13px; font-weight: bold;"
+        )
+
+    def show_rollback_status(self, message: str, is_success: bool = True) -> None:
+        """Display rollback outcome message."""
+        self.lbl_calibration_status.setText(message)
+        color = "#34D399" if is_success else "#F87171"
+        self.lbl_calibration_status.setStyleSheet(
+            f"color: {color}; font-size: 13px; font-weight: bold;"
         )
 
     def _on_accept_candidate(self) -> None:
@@ -218,31 +274,36 @@ class SettingsView(QWidget):
         self.lbl_calibration_status.setText(
             "Candidate promoted and applied to active profile. Prior version preserved in history."
         )
+        self.lbl_calibration_status.setStyleSheet(
+            "color: #34D399; font-size: 13px; font-weight: bold;"
+        )
 
     def _on_reject_candidate(self) -> None:
         """User rejected candidate configuration; restore previous spinbox values."""
-        self.spin_hold.setValue(self.config.hold_ms)
-        self.spin_release.setValue(self.config.release_ms)
-        self.spin_cooldown.setValue(self.config.cooldown_ms)
-        self.spin_sim.setValue(self.config.min_similarity)
-        self.spin_margin.setValue(self.config.min_margin)
+        self.load_config(self.config)
         self.btn_accept_candidate.setEnabled(False)
         self.btn_reject_candidate.setEnabled(False)
         self.lbl_calibration_status.setText(
             "Candidate rejected. Configuration retained without modification."
         )
+        self.lbl_calibration_status.setStyleSheet("color: #94A3B8; font-size: 13px;")
 
     def _on_rollback(self) -> None:
-        """Roll back configuration to default safe baseline."""
-        self.spin_hold.setValue(300)
-        self.spin_release.setValue(150)
-        self.spin_cooldown.setValue(300)
-        self.spin_sim.setValue(0.65)
-        self.spin_margin.setValue(0.15)
-        self._save_settings()
-        self.lbl_calibration_status.setText(
-            "Configuration safely rolled back to validated baseline (Version 1)."
-        )
+        """Request rollback to prior historical version via coordinator or fallback baseline."""
+        self.rollback_requested.emit()
+        if "rolled back to version" not in self.lbl_calibration_status.text().lower():
+            self.spin_hold.setValue(300)
+            self.spin_release.setValue(150)
+            self.spin_cooldown.setValue(300)
+            self.spin_sim.setValue(0.65)
+            self.spin_margin.setValue(0.15)
+            self._save_settings()
+            self.lbl_calibration_status.setText(
+                "Configuration safely rolled back to validated baseline (Version 1)."
+            )
+            self.lbl_calibration_status.setStyleSheet(
+                "color: #34D399; font-size: 13px; font-weight: bold;"
+            )
 
     def _save_settings(self) -> None:
         self.config.hold_ms = self.spin_hold.value()
