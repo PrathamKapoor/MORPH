@@ -83,4 +83,3 @@ def test_git_local_config():
         # On fresh clone where local config is not yet set, verify repo is valid
         res = subprocess.run(["git", "status"], cwd=root, capture_output=True)
         assert res.returncode == 0
-
