@@ -77,9 +77,6 @@ class IntentEngine:
         self._rearm_dwell_start_ns: int | None = None
         self._recovered_from_lost: bool = False
 
-        # Deduplication set
-        self._dispatched_uuids: set[str] = set()
-
     @property
     def candidate_label(self) -> str | None:
         """Active gesture label currently being held as candidate, if any."""
@@ -191,18 +188,54 @@ class IntentEngine:
             transitions.append(trans)
             self.reset(State.IDLE)
             self._recovered_from_lost = True
-            self._rearm_dwell_start_ns = now_ns
-            self.last_decision_reason = DecisionReason.REJECTED_LOW_CONFIDENCE
+
+            candidate = recognition.accepted_candidate_or_none
+            is_ambiguous = (
+                "AMBIGUOUS" in recognition.reject_reason or recognition.best_label == "AMBIGUOUS"
+            )
+            is_neutral = (candidate is None or candidate == "NEUTRAL") and not is_ambiguous
+
+            if is_neutral:
+                self._rearm_dwell_start_ns = now_ns
+            else:
+                self._rearm_dwell_start_ns = None
+
+            self.last_decision_reason = (
+                DecisionReason.REJECTED_AMBIGUOUS
+                if is_ambiguous
+                else DecisionReason.REJECTED_LOW_CONFIDENCE
+            )
             return self.state, None, transitions
 
-        # If recovering from loss, enforce minimum neutral dwell before admitting candidates
+        # If recovering from loss, enforce continuous resting neutral dwell before admitting candidates
         if self._recovered_from_lost:
+            candidate = recognition.accepted_candidate_or_none
+            is_ambiguous = (
+                "AMBIGUOUS" in recognition.reject_reason or recognition.best_label == "AMBIGUOUS"
+            )
+            is_neutral = (candidate is None or candidate == "NEUTRAL") and not is_ambiguous
+
+            if not is_neutral:
+                # Command gesture or ambiguous movement observed during recovery dwell;
+                # reset dwell start while maintaining recovery lock
+                self._rearm_dwell_start_ns = None
+                self.last_decision_reason = (
+                    DecisionReason.REJECTED_AMBIGUOUS
+                    if is_ambiguous
+                    else DecisionReason.REJECTED_LOW_CONFIDENCE
+                )
+                return self.state, None, transitions
+
+            if self._rearm_dwell_start_ns is None:
+                self._rearm_dwell_start_ns = now_ns
+
             rearm_ns = self.config.rearm_neutral_dwell_ms * 1_000_000
-            if (now_ns - (self._rearm_dwell_start_ns or now_ns)) < rearm_ns:
+            if (now_ns - self._rearm_dwell_start_ns) < rearm_ns:
                 self.last_decision_reason = DecisionReason.REJECTED_LOW_CONFIDENCE
                 return self.state, None, transitions
             else:
                 self._recovered_from_lost = False
+                self._rearm_dwell_start_ns = None
 
         candidate = recognition.accepted_candidate_or_none
         hold_ns = self.config.hold_ms * 1_000_000
@@ -282,9 +315,26 @@ class IntentEngine:
             if elapsed_hold >= hold_ns:
                 # Intention confirmed!
                 confirmed_gesture = self._candidate_label
-                action_name = self.action_mappings.get(confirmed_gesture, "NEXT_TILE")
+                if confirmed_gesture not in self.action_mappings:
+                    # Unmapped gestures cannot confirm an action; safely abort candidate to IDLE
+                    trans_unmapped = IntentTransition(
+                        t_ns=now_ns,
+                        before=State.CANDIDATE,
+                        after=State.IDLE,
+                        label_or_none=confirmed_gesture,
+                        reason=f"GESTURE_NOT_MAPPED ({confirmed_gesture})",
+                        config_version=self.config.config_version,
+                        frame_id=recognition.frame_id,
+                    )
+                    transitions.append(trans_unmapped)
+                    self.state = State.IDLE
+                    self._candidate_label = None
+                    self._candidate_start_ns = 0
+                    self.last_decision_reason = DecisionReason.REJECTED_LOW_CONFIDENCE
+                    return self.state, None, transitions
+
+                action_name = self.action_mappings[confirmed_gesture]
                 cmd_uuid = str(uuid.uuid4())
-                self._dispatched_uuids.add(cmd_uuid)
 
                 command = ConfirmedCommand(
                     command_event_uuid=cmd_uuid,
