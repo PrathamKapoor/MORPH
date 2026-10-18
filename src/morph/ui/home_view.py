@@ -35,6 +35,7 @@ class HomeView(QWidget):
         )
 
         self._is_active = False
+        self._no_camera_mode = False
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -225,6 +226,8 @@ class HomeView(QWidget):
 
     def update_health(self, health: TrackingHealth) -> None:
         """Update live telemetry metrics displayed on home screen."""
+        if self._no_camera_mode:
+            return
         sm_text = (
             health.source_mode.value
             if hasattr(health.source_mode, "value")
@@ -253,3 +256,22 @@ class HomeView(QWidget):
         self.lbl_drops.setText(
             f"Queue: {health.dropped_frames} dropped | {health.stale_frames} stale"
         )
+
+    def set_no_camera_mode(self, enabled: bool = True) -> None:
+        """Configure HomeView for explicit no-camera demonstration mode."""
+        self._no_camera_mode = enabled
+        if enabled:
+            self.lbl_camera.setText("Camera Sensor: No-Camera Mode (Simulated)")
+            self.lbl_camera.setStyleSheet(
+                "font-size: 14px; color: #F59E0B; font-weight: 600; padding: 4px;"
+            )
+            self.lbl_face.setText("Face Tracking: Inactive (Demo Mode)")
+            self.lbl_face.setStyleSheet("font-size: 14px; color: #94A3B8; padding: 4px;")
+            self.lbl_fps.setText("Processed: N/A (Demo Mode)")
+            self.lbl_drops.setText("Queue: Bypassed (Demo Mode)")
+            self.toggle_btn.setEnabled(False)
+            self.toggle_btn.setText(
+                "⏸ NO-CAMERA MODE (Live Gestures Disabled — Replay/Demo Available)"
+            )
+            self.status_badge.setText("⏸ NO-CAMERA DEMO MODE")
+            self.status_badge.setObjectName("header_status_paused")

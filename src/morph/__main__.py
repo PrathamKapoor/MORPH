@@ -101,7 +101,7 @@ def main() -> int:
 
     from morph.app import run_app
 
-    return run_app()
+    return run_app(no_camera=args.no_camera)
 
 
 if __name__ == "__main__":

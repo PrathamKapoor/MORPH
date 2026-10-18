@@ -31,8 +31,9 @@ class MorphApplication(QObject):
     action dispatch, and PySide6 user interface.
     """
 
-    def __init__(self, sys_argv: list[str] | None = None):
+    def __init__(self, sys_argv: list[str] | None = None, no_camera: bool = False):
         super().__init__()
+        self.no_camera = no_camera
         self.app = QApplication.instance() or QApplication(sys_argv or sys.argv)
         self.app.setApplicationName("MORPH 2.0")
         self.app.setOrganizationName("PrathamKapoor")
@@ -63,8 +64,12 @@ class MorphApplication(QObject):
         # Load stored profile calibration if present
         self._load_active_profile()
 
-        # Initialize hardware capture worker safely
-        self._init_worker()
+        # Initialize hardware capture worker safely (bypassed in no-camera mode)
+        if self.no_camera:
+            self.worker = None
+            self.window.set_no_camera_mode(True)
+        else:
+            self._init_worker()
 
         # Wire all Qt signals
         self._wire_signals()
@@ -147,6 +152,7 @@ class MorphApplication(QObject):
         self.dispatcher.register_handler("PREVIOUS_TILE", self.window.board_view.navigate_previous)
         self.dispatcher.register_handler("SELECT_TILE", self._handle_select_tile)
         self.dispatcher.register_handler("SPEAK_TILE", self._handle_select_tile)
+        self.dispatcher.register_handler("BACK", self.window.board_view.navigate_previous)
         self.dispatcher.register_handler("PAUSE", self.window.force_pause)
 
         # Connect speech output from board
@@ -244,6 +250,9 @@ class MorphApplication(QObject):
         self.intent_engine.reset(State.PAUSED)
 
     def _on_resume(self) -> None:
+        if self.no_camera:
+            self.window.force_pause()
+            return
         self.window.set_system_state(State.IDLE)
         self.intent_engine.reset(State.IDLE)
 
@@ -253,13 +262,13 @@ class MorphApplication(QObject):
     def _on_run_abc_replay(self) -> None:
         """Run reproducible A/B/C replay benchmark and update LabView table."""
         from morph.common.types import FeaturePacket, GroundTruthEvent
-        from morph.evaluation.replay import ReplayEngine
-        from tests.fixtures.synthetic_faces import (
+        from morph.evaluation.fixtures import (
             create_synthetic_brow_raise_landmarks,
             create_synthetic_mouth_open_landmarks,
             create_synthetic_neutral_landmarks,
             create_synthetic_smile_landmarks,
         )
+        from morph.evaluation.replay import ReplayEngine
 
         # Construct a controlled, reproducible stream
         # 1. Neutral baseline setup
@@ -467,13 +476,22 @@ class MorphApplication(QObject):
     def _on_worker_error(self, err: str) -> None:
         print(f"[MORPH Worker Error]: {err}")
 
+    def close(self) -> None:
+        """Safely terminate capture worker and release resources."""
+        if self.worker is not None:
+            self.worker.stop()
+            self.worker.wait(2000)
+
     def run(self) -> int:
         self.window.show()
         # Always enforce startup state is PAUSED
         self.window.set_system_state(State.PAUSED)
-        return self.app.exec()
+        try:
+            return self.app.exec()
+        finally:
+            self.close()
 
 
-def run_app() -> int:
-    morph_app = MorphApplication()
+def run_app(no_camera: bool = False) -> int:
+    morph_app = MorphApplication(no_camera=no_camera)
     return morph_app.run()

@@ -238,7 +238,15 @@ class MainWindow(QMainWindow):
         idx = route_map.get(route_name.lower(), 0)
         self.tab_bar.setCurrentIndex(idx)
 
+    def set_no_camera_mode(self, enabled: bool = True) -> None:
+        """Configure main window and sub-views for no-camera demonstration mode."""
+        self._no_camera_mode = enabled
+        self.home_view.set_no_camera_mode(enabled)
+
     def _toggle_global_pause(self) -> None:
+        if getattr(self, "_no_camera_mode", False):
+            self.force_pause()
+            return
         if self._state == State.PAUSED:
             self.set_system_state(State.IDLE)
             self.resume_requested.emit()
@@ -251,6 +259,9 @@ class MainWindow(QMainWindow):
         self.pause_requested.emit()
 
     def _on_home_activation_toggled(self, active: bool) -> None:
+        if getattr(self, "_no_camera_mode", False):
+            self.force_pause()
+            return
         if active:
             self.set_system_state(State.IDLE)
             self.resume_requested.emit()
