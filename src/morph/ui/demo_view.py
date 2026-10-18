@@ -353,7 +353,7 @@ class DemoView(QWidget):
 
         # 6. Benchmark Suite & Replay Readiness
         try:
-            from tests.fixtures.benchmark_scenarios import BenchmarkScenarioSuite
+            from morph.evaluation.fixtures import BenchmarkScenarioSuite
 
             suite = BenchmarkScenarioSuite()
             protos = suite.get_calibration_prototypes()
