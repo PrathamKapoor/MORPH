@@ -1,0 +1,55 @@
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Caches and temporary files
+.cache/
+.tmp/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local build and distribution
+build/
+dist/
+*.egg-info/
+
+# Local runtime data, recordings, logs, exports
+data/
+logs/
+exports/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-wal
+*.sqlite-shm
+*.db-wal
+*.db-shm
+
+# Model binaries (keep manifests and download scripts)
+models/*.task
+!models/face_landmarker.task.manifest.json
+
+# Local backups and archival bundles
+.backup/
+backups/
+*.bundle
+
+# Environment and local configurations
+.env
+.env.*
+*.env
+
+# IDE and OS artifacts
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
