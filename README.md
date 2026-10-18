@@ -36,7 +36,7 @@ flowchart LR
 
 1. **Facial Landmark Tracking**: Runs Google MediaPipe Face Landmarker locally on the CPU at 30 FPS, extracting 478 3D landmarks and verified blendshapes without writing video frames to disk.
 2. **Personalized Gesture Recognition**: Maps anatomical landmarks relative to the user's calibrated resting neutral baseline, computing scale-invariant displacements normalized by inter-ocular distance.
-3. **Temporal Intention Gating**: A pure mathematical 3-state Finite State Machine (FSM) that requires a candidate gesture to be held continuously above similarity threshold for $T_{hold}$ (default 250 ms), verified by a mandatory neutral release dwell ($T_{release} = 150$ ms) and refractory cooldown ($T_{cooldown} = 300$ ms).
+3. **Temporal Intention Gating**: A pure mathematical 6-state Finite State Machine (`PAUSED`, `TRACKING_LOST`, `IDLE`, `CANDIDATE`, `CONFIRMED`, `COOLDOWN`) that requires a candidate gesture to be held continuously above similarity threshold for $T_{hold}$ (default 250 ms), verified by a mandatory neutral release dwell ($T_{release} = 150$ ms), refractory cooldown ($T_{cooldown} = 300$ ms), and continuous resting neutral re-arm dwell ($T_{rearm} = 200$ ms) following tracking loss or pause.
 4. **Safe Action Sandboxing**: A strictly typed dispatcher that permits only allow-listed internal actions (`NEXT_TILE`, `PREV_TILE`, `SELECT_TILE`, `SPEAK_TEXT`, `PAUSE`), rejecting any arbitrary OS command execution.
 5. **Local Profile Adaptation**: SQLite-backed versioned profiles storing calibrated prototypes, ambiguity margins, and 1-click atomic rollback history.
 
