@@ -1,17 +1,20 @@
-"""Distribution smoke tests verifying PyInstaller build integrity (Milestone M6.8)."""
+"""Distribution smoke tests verifying PyInstaller build integrity and real directory relocation."""
 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 
 def test_distribution_directory_structure():
     """Verify packaged directory structure contains executable and bundled assets."""
     dist_dir = Path("dist/morph")
     if not dist_dir.exists():
-        return
+        pytest.skip("Packaged distribution dist/morph does not exist")
 
     exe_path = dist_dir / "morph.exe"
     assert exe_path.exists(), f"morph.exe not found at {exe_path}"
@@ -29,7 +32,7 @@ def test_distribution_zero_developer_residue():
     """Verify distribution contains zero .git, source control, or raw video capture residue."""
     dist_dir = Path("dist/morph")
     if not dist_dir.exists():
-        return
+        pytest.skip("Packaged distribution dist/morph does not exist")
 
     prohibited_patterns = [".git", ".pytest_cache", ".ruff_cache", "__pycache__"]
     prohibited_extensions = [".mp4", ".avi", ".mov", ".mkv", ".webm"]
@@ -51,7 +54,7 @@ def test_distribution_headless_and_version_execution():
     """Verify packaged binary executes with --version and --headless-check without crashing."""
     exe_path = Path("dist/morph/morph.exe")
     if not exe_path.exists():
-        return
+        pytest.skip("Packaged binary dist/morph/morph.exe does not exist")
 
     # 1. Test --version
     res_ver = subprocess.run(
@@ -75,13 +78,18 @@ def test_distribution_headless_and_version_execution():
 
 
 def test_distribution_relocation_execution(tmp_path):
-    """Verify packaged binary executes in an isolated directory without repository assets (M7.4)."""
-    exe_path = Path("dist/morph/morph.exe").resolve()
-    if not exe_path.exists():
-        return
+    """Verify packaged binary executes in an isolated directory without repository assets."""
+    dist_dir = Path("dist/morph")
+    if not dist_dir.exists():
+        pytest.skip("Packaged distribution dist/morph does not exist")
 
-    # Run from completely isolated directory (tmp_path) with no repository files
-    # Clear PYTHONPATH from environment to ensure no reliance on source tree
+    # Physically copy dist/morph to an isolated directory outside repo tree
+    relocated_dir = tmp_path / "morph_relocated"
+    shutil.copytree(dist_dir, relocated_dir)
+    exe_path = relocated_dir / "morph.exe"
+    assert exe_path.exists(), f"Relocated morph.exe not found at {exe_path}"
+
+    # Clear PYTHONPATH from environment to ensure zero reliance on repository source tree
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
 
