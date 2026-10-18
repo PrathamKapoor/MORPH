@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from typing import Callable
 
 from morph.common.types import ActionResult, ActionType, ConfirmedCommand
@@ -33,7 +34,7 @@ class ActionDispatcher:
     1. Only actions in the static ActionType allow-list can be executed.
     2. Prohibits shell commands, file modifications, or arbitrary scripts.
     3. Practice and replay modes strictly route to NoOpActionSink.
-    4. Enforces command deduplication by command_event_uuid.
+    4. Enforces bounded command deduplication by command_event_uuid (capacity limit and retention window).
     """
 
     ALLOWED_ACTIONS = {action.value for action in ActionType}
@@ -42,11 +43,15 @@ class ActionDispatcher:
         self,
         mode: str = "LIVE",
         noop_sink: NoOpActionSink | None = None,
+        max_capacity: int = 1000,
+        retention_sec: float = 60.0,
     ):
         self.mode = mode
         self.noop_sink = noop_sink or NoOpActionSink()
         self._handlers: dict[str, Callable[[], None]] = {}
-        self._executed_uuids: set[str] = set()
+        self.max_capacity = max_capacity
+        self.retention_sec = retention_sec
+        self._executed_uuids: OrderedDict[str, int] = OrderedDict()
 
     def register_handler(self, action_name: str, handler: Callable[[], None]) -> None:
         """Register a callable handler for an allow-listed action."""
@@ -60,6 +65,11 @@ class ActionDispatcher:
         """Execute a confirmed command event through the sandbox."""
         now_ns = time.monotonic_ns()
 
+        # Evict entries outside retention window
+        cutoff_ns = now_ns - int(self.retention_sec * 1_000_000_000)
+        while self._executed_uuids and next(iter(self._executed_uuids.values())) < cutoff_ns:
+            self._executed_uuids.popitem(last=False)
+
         # 1. Deduplication Check
         if cmd.command_event_uuid in self._executed_uuids:
             return ActionResult(
@@ -69,7 +79,12 @@ class ActionDispatcher:
                 success=False,
                 safe_error_code="DUPLICATE_COMMAND_UUID_IGNORED",
             )
-        self._executed_uuids.add(cmd.command_event_uuid)
+
+        # Evict oldest if capacity is reached
+        while len(self._executed_uuids) >= self.max_capacity:
+            self._executed_uuids.popitem(last=False)
+
+        self._executed_uuids[cmd.command_event_uuid] = now_ns
 
         # 2. Strict Allow-List Verification
         action_name = cmd.action_mapping_uuid
@@ -111,6 +126,6 @@ class ActionDispatcher:
             command_event_uuid=cmd.command_event_uuid,
             action_name=action_name,
             dispatched_at_ns=now_ns,
-            success=True,
+            success=False,
             safe_error_code="NO_HANDLER_ATTACHED",
         )
